@@ -51,6 +51,9 @@ async function isGroupThread(bot, threadId, event) {
 
 export async function handleIncomingEvent(bot, event) {
   try {
+log.info(
+  `📩 Facebook event: type=${event?.type} threadID=${event?.threadID} senderID=${event?.senderID} body=${JSON.stringify(event?.body)}`
+);
     // --- Événements système (ajout/départ de membres, changement de titre...) ---
     if (event.type === 'event') {
       const threadId = String(event.threadID);
@@ -169,5 +172,13 @@ async function handleUserMessage(bot, event) {
     if (settings.autotyping || settings.autorecording) bot.sendPresenceUpdate('composing', chatId).catch(() => {});
   }
 
-  await dispatchCommand(ctx);
+  log.info(
+  `🚀 Exécution de /${commandName} par ${senderId} dans ${chatId}`
+);
+
+await dispatchCommand(ctx);
+
+log.info(
+  `✅ /${commandName} terminé`
+);
 }
