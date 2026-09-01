@@ -6,69 +6,108 @@ import { handleIncomingEvent } from './messageHandler.js';
 
 const log = logger.child({ class: 'connection' });
 
+/*
+ * IMPORTANT
+ * ----------
+ * fca-eryxenx est CommonJS.
+ * On utilise require() via createRequire() au lieu de
+ * dépendre de l'interopérabilité ESM.
+ */
+
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+
 let login;
 
 try {
-  const fca = await import('ws3-fca');
+  const fca = require('fca-eryxenx');
 
-  // ws3-fca est CommonJS.
-  // Selon l'interopérabilité Node, login peut être exposé
-  // comme export nommé ou dans default.
   login =
-    fca.login ||
-    fca.default?.login ||
-    fca.default;
+    typeof fca === 'function'
+      ? fca
+      : fca?.login || fca?.default;
 
   if (typeof login !== 'function') {
     throw new Error(
-      `Fonction login introuvable. Exports disponibles: ${Object.keys(fca).join(', ')}`
+      `Export login introuvable. Type reçu: ${typeof fca}`
     );
   }
 
-  log.info('Module ws3-fca chargé correctement.');
+  log.info('Module fca-eryxenx chargé correctement.');
 } catch (err) {
   log.fatal(
-    "Impossible de charger 'ws3-fca'.",
+    "Impossible de charger 'fca-eryxenx'.",
     err?.message || String(err)
   );
+
   throw err;
 }
 
-const SESSION_SAVE_INTERVAL_MS = 10 * 60 * 1000;
+const SESSION_SAVE_INTERVAL_MS = 3 * 60 * 1000;
 
-let reconnectAttempts = 0;
+let apiInstance = null;
+let botInstance = null;
+let listenerHandle = null;
+let saveTimer = null;
 let connectionStarted = false;
-let mqttListenerStarted = false;
 
+/**
+ * Options FCA.
+ *
+ * Elles sont volontairement simples.
+ * Le dépôt MAMUN utilise également un objet optionsFca
+ * transmis directement à login().
+ */
+const fcaOptions = {
+  listenEvents: true,
+  selfListen: false,
+  updatePresence: false,
+  forceLogin: true,
+  autoMarkDelivery: false,
+  autoMarkRead: false,
+};
+
+/**
+ * Convertit les erreurs FCA en Error JS propre.
+ */
+function normalizeError(err) {
+  if (err instanceof Error) {
+    return err;
+  }
+
+  if (typeof err === 'string') {
+    return new Error(err);
+  }
+
+  try {
+    return new Error(JSON.stringify(err));
+  } catch {
+    return new Error(String(err));
+  }
+}
+
+/**
+ * Login FCA sous forme Promise.
+ */
 function loginAsync(appState) {
   return new Promise((resolve, reject) => {
     login(
       {
         appState,
       },
-      {
-        online: true,
-        listenEvents: true,
-        selfListen: false,
-        updatePresence: false,
-      },
+      fcaOptions,
       (err, api) => {
         if (err) {
-          reject(
-            err instanceof Error
-              ? err
-              : new Error(
-                  typeof err === 'string'
-                    ? err
-                    : JSON.stringify(err)
-                )
-          );
+          reject(normalizeError(err));
           return;
         }
 
         if (!api) {
           reject(
-            new Error('ws3-fca n’a retourné aucune API.')
+            new Error(
+              'fca-eryxenx n’a retourné aucune API.'
+            )
           );
           return;
         }
@@ -79,6 +118,9 @@ function loginAsync(appState) {
   });
 }
 
+/**
+ * Charge l'AppState.
+ */
 function loadAppState() {
   if (config.accountJsonInline) {
     try {
@@ -105,10 +147,10 @@ function loadAppState() {
     );
   }
 
-  let appState;
+  let state;
 
   try {
-    appState = JSON.parse(
+    state = JSON.parse(
       fs.readFileSync(
         config.accountJsonPath,
         'utf8'
@@ -120,28 +162,28 @@ function loadAppState() {
     );
   }
 
-  if (
-    !Array.isArray(appState) ||
-    appState.length === 0
-  ) {
+  if (!Array.isArray(state) || state.length === 0) {
     throw new Error(
-      'account.json contient un AppState vide ou invalide.'
+      'account.json est vide ou ne contient pas un AppState valide.'
     );
   }
 
-  return appState;
+  return state;
 }
 
-function saveAppState(api) {
+/**
+ * Sauvegarde périodiquement l'AppState.
+ */
+function saveAppState() {
   try {
     if (
-      !api ||
-      typeof api.getAppState !== 'function'
+      !apiInstance ||
+      typeof apiInstance.getAppState !== 'function'
     ) {
       return;
     }
 
-    const state = api.getAppState();
+    const state = apiInstance.getAppState();
 
     if (!Array.isArray(state) || state.length === 0) {
       log.warn(
@@ -161,33 +203,89 @@ function saveAppState(api) {
     );
   } catch (err) {
     log.warn(
-      'Échec sauvegarde AppState.',
+      'Échec de sauvegarde de la session.',
       err.message
     );
   }
 }
 
-function startMqttListener(api, bot) {
-  if (mqttListenerStarted) {
-    log.warn(
-      'Le listener MQTT est déjà actif.'
-    );
+/**
+ * Arrête proprement l'ancien listener MQTT.
+ *
+ * Le dépôt MAMUN utilise également stopListening()
+ * avant de créer un nouveau listener.
+ */
+async function stopMqttListener() {
+  if (!apiInstance) {
+    listenerHandle = null;
     return;
   }
 
-  if (typeof api.listenMqtt !== 'function') {
-    throw new Error(
-      'ws3-fca ne fournit pas api.listenMqtt().'
+  try {
+    if (
+      typeof apiInstance.stopListening === 'function'
+    ) {
+      await new Promise((resolve) => {
+        let finished = false;
+
+        const done = () => {
+          if (finished) return;
+          finished = true;
+          resolve();
+        };
+
+        try {
+          const result =
+            apiInstance.stopListening(done);
+
+          if (
+            result &&
+            typeof result.then === 'function'
+          ) {
+            result.then(done).catch(done);
+          }
+        } catch {
+          done();
+        }
+
+        setTimeout(done, 5000);
+      });
+    }
+  } catch (err) {
+    log.warn(
+      'Erreur lors de l’arrêt du listener MQTT.',
+      err.message
     );
   }
 
-  mqttListenerStarted = true;
+  listenerHandle = null;
+}
+
+/**
+ * Démarre le listener MQTT.
+ */
+async function startMqttListener() {
+  if (!apiInstance || !botInstance) {
+    throw new Error(
+      'API Facebook indisponible pour démarrer MQTT.'
+    );
+  }
+
+  await stopMqttListener();
+
+  if (
+    typeof apiInstance.listenMqtt !== 'function'
+  ) {
+    throw new Error(
+      'fca-eryxenx ne fournit pas api.listenMqtt().'
+    );
+  }
 
   log.info(
-    '👂 Démarrage du listener MQTT...'
+    '👂 Démarrage du listener MQTT Facebook...'
   );
 
-  api.listenMqtt((err, event) => {
+  const callback = (err, event) => {
     if (err) {
       log.error(
         '❌ Erreur MQTT:',
@@ -200,158 +298,195 @@ function startMqttListener(api, bot) {
       return;
     }
 
+    /*
+     * Log volontairement court pour confirmer
+     * que les événements arrivent réellement.
+     */
     log.info(
-      `📩 Facebook → type=${event.type || 'unknown'} thread=${event.threadID || 'unknown'} sender=${event.senderID || 'unknown'} body=${JSON.stringify(event.body || '')}`
+      `📩 EVENT Facebook: type=${event.type || 'unknown'} ` +
+      `thread=${event.threadID || 'unknown'} ` +
+      `sender=${event.senderID || 'unknown'} ` +
+      `body=${JSON.stringify(event.body || '')}`
     );
 
-    handleIncomingEvent(bot, event).catch((error) => {
+    handleIncomingEvent(
+      botInstance,
+      event
+    ).catch((error) => {
       log.error(
         '❌ Erreur messageHandler:',
         error?.message || String(error),
         error?.stack || ''
       );
     });
-  });
+  };
+
+  /*
+   * IMPORTANT :
+   * fca-eryxenx retourne le handle du listener.
+   * On le conserve afin de pouvoir le stopper/recréer.
+   */
+  listenerHandle =
+    apiInstance.listenMqtt(callback);
 
   log.info(
-    '✅ Listener MQTT activé.'
+    '✅ Listener MQTT Facebook activé.'
   );
+
+  return listenerHandle;
 }
 
+/**
+ * Connexion principale.
+ */
 export async function startConnection() {
   if (connectionStarted) {
     log.warn(
-      'startConnection() appelé alors que la connexion existe déjà.'
+      'startConnection() appelé alors qu’une connexion existe déjà.'
     );
-    return;
+
+    return botInstance;
   }
 
   connectionStarted = true;
 
-  const appState = loadAppState();
-
-  let api;
-
   try {
+    const appState = loadAppState();
+
     log.info(
       '🔐 Connexion à Facebook avec AppState...'
     );
 
-    api = await loginAsync(appState);
+    apiInstance = await loginAsync(
+      appState
+    );
 
     log.info(
       '✅ Authentification Facebook réussie.'
     );
+
+    botInstance =
+      new FacebookAdapter(apiInstance);
+
+    const userId = String(
+      apiInstance.getCurrentUserID()
+    );
+
+    let userName =
+      config.botName;
+
+    try {
+      const info =
+        await new Promise(
+          (resolve, reject) => {
+            apiInstance.getUserInfo(
+              userId,
+              (err, result) => {
+                if (err) {
+                  reject(err);
+                  return;
+                }
+
+                resolve(result);
+              }
+            );
+          }
+        );
+
+      userName =
+        info?.[userId]?.name ||
+        userName;
+    } catch (err) {
+      log.warn(
+        'Impossible de récupérer le nom du compte.',
+        err.message
+      );
+    }
+
+    botInstance.user = {
+      id: userId,
+      name: userName,
+    };
+
+    log.info(
+      `✅ ${config.botName} connecté à Facebook en tant que "${userName}" (id: ${userId}).`
+    );
+
+    /*
+     * Démarrage du listener APRÈS l'authentification.
+     */
+    await startMqttListener();
+
+    /*
+     * Sauvegarde de session.
+     */
+    if (saveTimer) {
+      clearInterval(saveTimer);
+    }
+
+    saveTimer = setInterval(
+      saveAppState,
+      SESSION_SAVE_INTERVAL_MS
+    );
+
+    saveTimer.unref?.();
+
+    log.info(
+      '🟢 H$Λ BOT est prêt à recevoir les messages Facebook.'
+    );
+
+    return botInstance;
   } catch (err) {
     connectionStarted = false;
 
     log.fatal(
-      '❌ Échec de connexion à Facebook.',
-      err?.message || String(err)
+      '❌ Échec du démarrage de la connexion Facebook:',
+      err?.message || String(err),
+      err?.stack || ''
     );
 
     throw err;
   }
-
-  const bot = new FacebookAdapter(api);
-
-  let userId;
-
-  try {
-    userId = String(
-      api.getCurrentUserID()
-    );
-  } catch (err) {
-    connectionStarted = false;
-
-    throw new Error(
-      `Impossible de récupérer le Facebook ID : ${err.message}`
-    );
-  }
-
-  let userName = config.botName;
-
-  try {
-    const info = await new Promise(
-      (resolve, reject) => {
-        api.getUserInfo(
-          userId,
-          (err, result) => {
-            if (err) {
-              reject(err);
-              return;
-            }
-
-            resolve(result);
-          }
-        );
-      }
-    );
-
-    userName =
-      info?.[userId]?.name ||
-      userName;
-  } catch (err) {
-    log.warn(
-      'Impossible de récupérer le nom Facebook.',
-      err.message
-    );
-  }
-
-  bot.user = {
-    id: userId,
-    name: userName,
-  };
-
-  log.info(
-    `👑 ${config.botName} connecté à Facebook en tant que "${userName}" (id: ${userId}).`
-  );
-
-  // IMPORTANT :
-  // Un seul listener MQTT pour toute la durée de vie du bot.
-  startMqttListener(api, bot);
-
-  const saveTimer = setInterval(
-    () => saveAppState(api),
-    SESSION_SAVE_INTERVAL_MS
-  );
-
-  saveTimer.unref?.();
-
-  reconnectAttempts = 0;
-
-  log.info(
-    '🟢 H$Λ BOT est maintenant prêt à recevoir les messages.'
-  );
-
-  return bot;
 }
 
-export function scheduleReconnect() {
-  if (connectionStarted) {
-    log.warn(
-      'Reconnexion ignorée : une connexion est déjà active.'
+/**
+ * Reconnexion manuelle.
+ */
+export async function scheduleReconnect() {
+  try {
+    connectionStarted = false;
+
+    await stopMqttListener();
+
+    await startConnection();
+  } catch (err) {
+    log.error(
+      '❌ Échec de la reconnexion Facebook:',
+      err?.message || String(err)
     );
-    return;
+  }
+}
+
+/**
+ * Permet de fermer proprement la connexion.
+ */
+export async function stopConnection() {
+  log.info(
+    '🛑 Arrêt de la connexion Facebook...'
+  );
+
+  if (saveTimer) {
+    clearInterval(saveTimer);
+    saveTimer = null;
   }
 
-  reconnectAttempts += 1;
+  await stopMqttListener();
 
-  const delay = Math.min(
-    60_000,
-    5_000 * reconnectAttempts
+  apiInstance = null;
+  botInstance = null;
+  connectionStarted = false;
+
+  log.info(
+    '✅ Connexion Facebook arrêtée.'
   );
-
-  log.warn(
-    `🔄 Reconnexion prévue dans ${delay / 1000}s...`
-  );
-
-  setTimeout(() => {
-    startConnection().catch((err) => {
-      log.error(
-        '❌ Échec de la reconnexion:',
-        err?.message || String(err)
-      );
-    });
-  }, delay);
 }
