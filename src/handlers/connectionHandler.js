@@ -263,26 +263,30 @@ export async function startConnection() {
    * ws3-fca expose listenMqtt(callback).
    */
   api.listenMqtt((err, event) => {
-    if (err) {
-      log.error(
-        'Erreur listenMqtt',
-        err.message || err
-      );
-      return;
-    }
+  if (err) {
+    log.error(
+      '❌ listenMqtt error:',
+      err.message || err
+    );
+    return;
+  }
 
-    if (!event) {
-      return;
-    }
+  if (!event) {
+    return;
+  }
 
-    handleIncomingEvent(bot, event).catch((error) => {
-      log.error(
-        'Erreur non gérée dans le traitement du message',
-        error.message,
-        error.stack
-      );
-    });
+  log.info(
+    `📩 EVENT FACEBOOK → type=${event.type} threadID=${event.threadID} senderID=${event.senderID} body=${JSON.stringify(event.body)}`
+  );
+
+  handleIncomingEvent(bot, event).catch((error) => {
+    log.error(
+      '❌ Erreur messageHandler:',
+      error.message,
+      error.stack
+    );
   });
+});
 
   /**
    * Sauvegarde périodique de l'AppState.
