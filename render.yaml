@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: hsa-fb-bot
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_NAME
+        value: "H$Λ BOT"
+      - key: PREFIX
+        value: "/"
+      - key: ACCOUNT_JSON
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: FB_STATUS_THREAD_ID
+        sync: false
+      - key: PORT
+        value: 3000
+      - key: DATA_DIR
+        value: /var/data
+      - key: ACCOUNT_JSON_PATH
+        value: /var/data/account.json
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_API_URL
+        value: https://api.openai.com/v1/chat/completions
+      - key: AI_MODEL
+        value: gpt-4o-mini
+      - key: RATE_LIMIT_MAX
+        value: 8
+      - key: RATE_LIMIT_WINDOW_MS
+        value: 10000
+    # IMPORTANT : le plan "free" de Render utilise un système de fichiers
+    # ÉPHÉMÈRE. La session (account.json) sera perdue à chaque redéploiement,
+    # sauf si vous attachez un Persistent Disk (bloc "disk" ci-dessous) ET
+    # utilisez ACCOUNT_JSON (variable d'env) pour la réamorcer à chaque
+    # démarrage tant que le disque n'est pas encore peuplé.
+    # disk:
+    #   name: hsa-fb-bot-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

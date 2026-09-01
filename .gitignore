@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Env
+.env
+
+# Session Facebook (cookies du compte — TRÈS sensible, ne jamais partager)
+account.json
+account.json.bak
+
+# Données persistantes
+data/*.json
+!data/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp media
+tmp/
+temp/
+*.tmp
+
+# Artefacts de test
+test/.tmp-*
