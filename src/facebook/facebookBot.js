@@ -1,232 +1,694 @@
-// Adaptateur Facebook Messenger (via FCA — Facebook Chat API non officielle,
-// ex: ws3-fca — automatisation d'un compte personnel par rejeu de session).
-//
-// Objectif : exposer une interface proche de celle utilisée par les ~145
-// commandes H$Λ BOT (sendMessage, groupParticipantsUpdate, etc.), pour
-// réutiliser la quasi-totalité du code métier existant. Contrairement à
-// Telegram (API Bot officielle, très restreinte), un compte personnel
-// automatisé a en réalité PLUS de capacités réelles sur certains points
-// (lister tous les membres, en ajouter, marquer comme lu) mais AUCUNE sur
-// d'autres qui n'existent tout simplement pas côté Messenger (supprimer le
-// message d'un tiers, description de groupe, lien d'invitation stable,
-// restreindre qui peut écrire). Chaque limite réelle est documentée ci-dessous
-// — jamais simulée.
-
 import fs from 'node:fs';
 import { logger } from '../utils/logger.js';
-import { tempFilePath, cleanupFile } from '../utils/media.js';
+import {
+  tempFilePath,
+  cleanupFile,
+} from '../utils/media.js';
 
-const log = logger.child({ class: 'facebookBot' });
+const log = logger.child({
+  class: 'facebookBot',
+});
 
 function callbackToPromise(fn) {
   return new Promise((resolve, reject) => {
-    fn((err, result) => (err ? reject(err instanceof Error ? err : new Error(JSON.stringify(err))) : resolve(result)));
+    try {
+      fn((err, result) => {
+        if (err) {
+          reject(
+            err instanceof Error
+              ? err
+              : new Error(
+                  typeof err === 'string'
+                    ? err
+                    : JSON.stringify(err)
+                )
+          );
+          return;
+        }
+
+        resolve(result);
+      });
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
-/** Convertit un Buffer (ou {url}) en flux lisible, tel qu'attendu par FCA pour les pièces jointes. */
 async function toAttachmentStream(value) {
   let buffer = value;
-  if (value && typeof value === 'object' && value.url) {
-    const res = await fetch(value.url);
-    if (!res.ok) throw new Error(`Téléchargement de la pièce jointe échoué (${res.status}).`);
-    buffer = Buffer.from(await res.arrayBuffer());
-  }
-  if (!Buffer.isBuffer(buffer)) throw new Error('Pièce jointe invalide.');
 
-  const file = tempFilePath('bin');
-  fs.writeFileSync(file, buffer);
-  const stream = fs.createReadStream(file);
-  stream.once('close', () => cleanupFile(file));
+  if (
+    value &&
+    typeof value === 'object' &&
+    value.url
+  ) {
+    const response = await fetch(
+      value.url
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Téléchargement de la pièce jointe échoué (${response.status}).`
+      );
+    }
+
+    buffer = Buffer.from(
+      await response.arrayBuffer()
+    );
+  }
+
+  if (!Buffer.isBuffer(buffer)) {
+    throw new Error(
+      'Pièce jointe invalide.'
+    );
+  }
+
+  const file =
+    tempFilePath('bin');
+
+  fs.writeFileSync(
+    file,
+    buffer
+  );
+
+  const stream =
+    fs.createReadStream(file);
+
+  const cleanup = () => {
+    try {
+      cleanupFile(file);
+    } catch {
+      // rien
+    }
+  };
+
+  stream.once(
+    'close',
+    cleanup
+  );
+
+  stream.once(
+    'error',
+    cleanup
+  );
+
   return stream;
 }
 
 export class FacebookAdapter {
-  /** @param {object} api Instance FCA déjà authentifiée (retournée par login()). */
   constructor(api) {
+    if (!api) {
+      throw new Error(
+        'FacebookAdapter nécessite une API Facebook.'
+      );
+    }
+
     this.api = api;
-    this.user = null; // renseigné après login, voir handlers/connectionHandler.js
-    this._threadCache = new Map(); // threadID -> { data, expiresAt }
+    this.user = null;
+
+    this._threadCache =
+      new Map();
   }
 
-  // ---------------------------------------------------------------------
-  // Envoi de message — dispatch selon le "type" de contenu.
-  // ---------------------------------------------------------------------
-  async sendMessage(chatId, content, opts = {}) {
-    const replyId = opts.quoted?.messageID;
+  /**
+   * Envoi d'un message.
+   */
+  async sendMessage(
+    chatId,
+    content,
+    opts = {}
+  ) {
+    if (
+      !content ||
+      typeof content !== 'object'
+    ) {
+      throw new Error(
+        'Contenu Facebook invalide.'
+      );
+    }
 
-    // --- Suppression : LIMITATION FACEBOOK ---
-    // Messenger ne permet à personne — pas même un admin — de supprimer le
-    // message d'un tiers. Seul l'auteur peut "retirer" (unsend) SON PROPRE
-    // message, et seulement peu de temps après l'envoi.
+    const replyId =
+      opts?.quoted?.messageID ||
+      opts?.quoted?.messageId ||
+      opts?.quoted?.mid ||
+      null;
+
     if (content.delete) {
-      if (content.delete.fromMe) {
-        await callbackToPromise((cb) => this.api.unsendMessage(content.delete.id, cb));
-        return { key: { id: content.delete.id, remoteJid: String(chatId) } };
+      if (
+        !content.delete.fromMe
+      ) {
+        throw new Error(
+          'DELETE_NOT_SUPPORTED_BY_FACEBOOK'
+        );
       }
-      throw new Error('DELETE_NOT_SUPPORTED_BY_FACEBOOK');
+
+      if (
+        typeof this.api.unsendMessage !==
+        'function'
+      ) {
+        throw new Error(
+          'unsendMessage non disponible.'
+        );
+      }
+
+      await callbackToPromise(
+        (cb) =>
+          this.api.unsendMessage(
+            content.delete.id,
+            cb
+          )
+      );
+
+      return {
+        key: {
+          id: content.delete.id,
+          remoteJid: String(chatId),
+        },
+      };
     }
 
-    // --- Édition : Messenger ne permet pas de modifier un message envoyé ---
     if (content.edit) {
-      throw new Error('EDIT_NOT_SUPPORTED_BY_FACEBOOK');
+      throw new Error(
+        'EDIT_NOT_SUPPORTED_BY_FACEBOOK'
+      );
     }
 
-    // --- Contact (vCard) : repli sur un simple message texte ---
     if (content.contacts) {
-      const c = content.contacts.contacts?.[0];
-      const phoneMatch = c?.vcard?.match(/waid=(\d+)/);
-      const text = phoneMatch ? `👑 Contact : ${phoneMatch[1]}` : content.contacts.displayName || 'Contact';
-      return this._sendRaw(chatId, { body: text }, replyId);
+      const contact =
+        content.contacts
+          ?.contacts?.[0];
+
+      const match =
+        contact?.vcard?.match(
+          /waid=(\d+)/
+        );
+
+      const text =
+        match
+          ? `👑 Contact : ${match[1]}`
+          : content.contacts
+              ?.displayName ||
+            'Contact';
+
+      return this._sendRaw(
+        chatId,
+        {
+          body: text,
+        },
+        replyId
+      );
     }
 
-    // --- Sticker : LIMITATION FACEBOOK ---
-    // Les stickers Messenger sont des ID fixes issus des packs Facebook — on
-    // ne peut pas en envoyer un fabriqué à partir d'une image quelconque.
-    // On envoie donc l'image convertie comme une pièce jointe classique.
-    if (content.sticker !== undefined) {
-      const stream = await toAttachmentStream(content.sticker);
-      return this._sendRaw(chatId, { body: '', attachment: stream }, replyId);
+    if (
+      content.sticker !==
+      undefined
+    ) {
+      const stream =
+        await toAttachmentStream(
+          content.sticker
+        );
+
+      return this._sendRaw(
+        chatId,
+        {
+          body: '',
+          attachment: stream,
+        },
+        replyId
+      );
     }
 
-    if (content.image !== undefined) {
-      const stream = await toAttachmentStream(content.image);
-      return this._sendRaw(chatId, { body: content.caption || '', attachment: stream }, replyId);
+    if (
+      content.image !==
+      undefined
+    ) {
+      const stream =
+        await toAttachmentStream(
+          content.image
+        );
+
+      return this._sendRaw(
+        chatId,
+        {
+          body:
+            content.caption ||
+            '',
+          attachment: stream,
+        },
+        replyId
+      );
     }
 
-    if (content.video !== undefined) {
-      const stream = await toAttachmentStream(content.video);
-      return this._sendRaw(chatId, { body: content.caption || '', attachment: stream }, replyId);
+    if (
+      content.video !==
+      undefined
+    ) {
+      const stream =
+        await toAttachmentStream(
+          content.video
+        );
+
+      return this._sendRaw(
+        chatId,
+        {
+          body:
+            content.caption ||
+            '',
+          attachment: stream,
+        },
+        replyId
+      );
     }
 
-    if (content.audio !== undefined) {
-      const stream = await toAttachmentStream(content.audio);
-      return this._sendRaw(chatId, { body: '', attachment: stream }, replyId);
+    if (
+      content.audio !==
+      undefined
+    ) {
+      const stream =
+        await toAttachmentStream(
+          content.audio
+        );
+
+      return this._sendRaw(
+        chatId,
+        {
+          body: '',
+          attachment: stream,
+        },
+        replyId
+      );
     }
 
-    if (content.document !== undefined) {
-      const stream = await toAttachmentStream(content.document);
-      return this._sendRaw(chatId, { body: content.caption || '', attachment: stream }, replyId);
+    if (
+      content.document !==
+      undefined
+    ) {
+      const stream =
+        await toAttachmentStream(
+          content.document
+        );
+
+      return this._sendRaw(
+        chatId,
+        {
+          body:
+            content.caption ||
+            '',
+          attachment: stream,
+        },
+        replyId
+      );
     }
 
-    if (content.text !== undefined) {
-      const message = { body: content.text };
-      if (Array.isArray(content.mentions)) message.mentions = content.mentions;
-      return this._sendRaw(chatId, message, replyId);
+    if (
+      content.text !==
+      undefined
+    ) {
+      const message = {
+        body: String(
+          content.text
+        ),
+      };
+
+      if (
+        Array.isArray(
+          content.mentions
+        ) &&
+        content.mentions.length
+      ) {
+        message.mentions =
+          content.mentions;
+      }
+
+      return this._sendRaw(
+        chatId,
+        message,
+        replyId
+      );
     }
 
-    throw new Error('Contenu de message non pris en charge par FacebookAdapter.');
-  }
-
-  async _sendRaw(chatId, message, replyId) {
-    const result = await callbackToPromise((cb) =>
-      replyId ? this.api.sendMessage(message, chatId, cb, replyId) : this.api.sendMessage(message, chatId, cb)
+    throw new Error(
+      'Contenu non pris en charge par FacebookAdapter.'
     );
-    const messageID = result?.messageID || result?.messageId;
-    return { key: { id: messageID, remoteJid: String(chatId), messageID } };
   }
 
-  // ---------------------------------------------------------------------
-  // Métadonnées de groupe (thread). Contrairement à Telegram, un compte
-  // personnel voit la liste COMPLÈTE des membres (avantage réel ici).
-  // `desc` reste toujours vide : Messenger n'a pas de description de groupe.
-  // ---------------------------------------------------------------------
-  async groupMetadata(chatId) {
-    const info = await callbackToPromise((cb) => this.api.getThreadInfo(chatId, cb));
-    const adminSet = new Set((info.adminIDs || []).map((a) => String(a.id ?? a)));
+  /**
+   * Envoi brut FCA.
+   */
+  async _sendRaw(
+    chatId,
+    message,
+    replyId = null
+  ) {
+    if (
+      typeof this.api.sendMessage !==
+      'function'
+    ) {
+      throw new Error(
+        'api.sendMessage() n’est pas disponible.'
+      );
+    }
 
-    const participants = (info.participantIDs || []).map((id) => ({
-      id: String(id),
-      admin: adminSet.has(String(id)) ? 'admin' : null,
-    }));
+    const result =
+      await callbackToPromise(
+        (cb) => {
+          if (replyId) {
+            this.api.sendMessage(
+              message,
+              chatId,
+              cb,
+              replyId
+            );
+          } else {
+            this.api.sendMessage(
+              message,
+              chatId,
+              cb
+            );
+          }
+        }
+      );
+
+    const messageID =
+      result?.messageID ||
+      result?.messageId ||
+      result?.mid ||
+      null;
+
+    return {
+      key: {
+        id: messageID,
+        remoteJid: String(
+          chatId
+        ),
+        messageID,
+      },
+
+      raw: result,
+    };
+  }
+
+  async groupMetadata(
+    chatId
+  ) {
+    if (
+      typeof this.api.getThreadInfo !==
+      'function'
+    ) {
+      throw new Error(
+        'getThreadInfo() non disponible.'
+      );
+    }
+
+    const info =
+      await callbackToPromise(
+        (cb) =>
+          this.api.getThreadInfo(
+            chatId,
+            cb
+          )
+      );
+
+    const adminSet =
+      new Set(
+        (info.adminIDs || [])
+          .map((admin) =>
+            String(
+              admin?.id ??
+              admin
+            )
+          )
+      );
+
+    const participants =
+      (
+        info.participantIDs ||
+        []
+      ).map((id) => ({
+        id: String(id),
+        admin:
+          adminSet.has(
+            String(id)
+          )
+            ? 'admin'
+            : null,
+      }));
 
     return {
       id: String(chatId),
-      subject: info.threadName || info.name || '',
-      desc: '', // non disponible côté Messenger
-      memberCount: participants.length,
+      subject:
+        info.threadName ||
+        info.name ||
+        '',
+      desc: '',
+      memberCount:
+        participants.length,
       participants,
     };
   }
 
-  async getChatMemberStatus(chatId, userId) {
+  async getChatMemberStatus(
+    chatId,
+    userId
+  ) {
     try {
-      const meta = await this.groupMetadata(chatId);
-      const p = meta.participants.find((x) => x.id === String(userId));
-      if (!p) return null;
-      return p.admin ? 'administrator' : 'member';
+      const metadata =
+        await this.groupMetadata(
+          chatId
+        );
+
+      const participant =
+        metadata.participants.find(
+          (item) =>
+            item.id ===
+            String(userId)
+        );
+
+      if (!participant) {
+        return null;
+      }
+
+      return participant.admin
+        ? 'administrator'
+        : 'member';
     } catch {
       return null;
     }
   }
 
-  /** LIMITATION FACEBOOK : les indicateurs de saisie sont génériques (pas de distinction texte/vocal). */
-  async sendPresenceUpdate(_action, chatId) {
+  async sendPresenceUpdate(
+    _action,
+    chatId
+  ) {
+    if (
+      typeof this.api
+        .sendTypingIndicator !==
+      'function'
+    ) {
+      return;
+    }
+
     try {
-      await callbackToPromise((cb) => this.api.sendTypingIndicator(chatId, cb));
+      await callbackToPromise(
+        (cb) =>
+          this.api.sendTypingIndicator(
+            chatId,
+            cb
+          )
+      );
     } catch (err) {
-      log.warn("Échec de l'indicateur de saisie", err.message);
+      log.warn(
+        'Échec typing indicator',
+        err.message
+      );
     }
   }
 
-  /** Fonctionne réellement (contrairement à Telegram) : un compte personnel a accès aux accusés de lecture. */
-  async readMessages(threadId) {
+  async readMessages(
+    threadId
+  ) {
+    if (
+      typeof this.api.markAsRead !==
+      'function'
+    ) {
+      return;
+    }
+
     try {
-      await callbackToPromise((cb) => this.api.markAsRead(threadId, cb));
+      await callbackToPromise(
+        (cb) =>
+          this.api.markAsRead(
+            threadId,
+            cb
+          )
+      );
     } catch (err) {
-      log.warn('Échec du marquage "lu"', err.message);
+      log.warn(
+        'Échec marquage lu',
+        err.message
+      );
     }
   }
 
-  // ---------------------------------------------------------------------
-  // Gestion des membres. Contrairement à Telegram, ajouter/exclure
-  // fonctionne réellement ici (un compte perso a ces droits, comme
-  // n'importe quel membre du groupe le ferait depuis l'app).
-  // ---------------------------------------------------------------------
-  async groupParticipantsUpdate(chatId, ids, action) {
+  async groupParticipantsUpdate(
+    chatId,
+    ids,
+    action
+  ) {
     for (const id of ids) {
-      if (action === 'remove') {
-        await callbackToPromise((cb) => this.api.removeUserFromGroup(id, chatId, cb));
-      } else if (action === 'add') {
-        await callbackToPromise((cb) => this.api.addUserToGroup(id, chatId, cb));
-      } else if (action === 'promote') {
-        await callbackToPromise((cb) => this.api.changeAdminStatus(chatId, id, true, cb));
-      } else if (action === 'demote') {
-        await callbackToPromise((cb) => this.api.changeAdminStatus(chatId, id, false, cb));
+      if (
+        action === 'remove' &&
+        typeof this.api
+          .removeUserFromGroup ===
+          'function'
+      ) {
+        await callbackToPromise(
+          (cb) =>
+            this.api.removeUserFromGroup(
+              id,
+              chatId,
+              cb
+            )
+        );
+      }
+
+      else if (
+        action === 'add' &&
+        typeof this.api
+          .addUserToGroup ===
+          'function'
+      ) {
+        await callbackToPromise(
+          (cb) =>
+            this.api.addUserToGroup(
+              id,
+              chatId,
+              cb
+            )
+        );
+      }
+
+      else if (
+        action === 'promote' &&
+        typeof this.api
+          .changeAdminStatus ===
+          'function'
+      ) {
+        await callbackToPromise(
+          (cb) =>
+            this.api.changeAdminStatus(
+              chatId,
+              id,
+              true,
+              cb
+            )
+        );
+      }
+
+      else if (
+        action === 'demote' &&
+        typeof this.api
+          .changeAdminStatus ===
+          'function'
+      ) {
+        await callbackToPromise(
+          (cb) =>
+            this.api.changeAdminStatus(
+              chatId,
+              id,
+              false,
+              cb
+            )
+        );
+      }
+
+      else {
+        throw new Error(
+          `Action Facebook non supportée: ${action}`
+        );
       }
     }
   }
 
-  /** LIMITATION FACEBOOK : bloquer un utilisateur n'est pas exposé par les libs FCA courantes. */
   async updateBlockStatus() {
-    throw new Error('BLOCK_NOT_SUPPORTED_BY_FACEBOOK');
+    throw new Error(
+      'BLOCK_NOT_SUPPORTED_BY_FACEBOOK'
+    );
   }
 
-  /** LIMITATION FACEBOOK : pas de lien d'invitation stable via FCA. Utilisez /add (fonctionne réellement). */
   async groupInviteCode() {
-    throw new Error('INVITE_LINK_NOT_SUPPORTED_BY_FACEBOOK');
+    throw new Error(
+      'INVITE_LINK_NOT_SUPPORTED_BY_FACEBOOK'
+    );
   }
 
   async groupRevokeInvite() {
-    throw new Error('INVITE_LINK_NOT_SUPPORTED_BY_FACEBOOK');
+    throw new Error(
+      'INVITE_LINK_NOT_SUPPORTED_BY_FACEBOOK'
+    );
   }
 
-  async groupUpdateSubject(chatId, title) {
-    return callbackToPromise((cb) => this.api.setTitle(title, chatId, cb));
+  async groupUpdateSubject(
+    chatId,
+    title
+  ) {
+    if (
+      typeof this.api.setTitle !==
+      'function'
+    ) {
+      throw new Error(
+        'setTitle() non disponible.'
+      );
+    }
+
+    return callbackToPromise(
+      (cb) =>
+        this.api.setTitle(
+          title,
+          chatId,
+          cb
+        )
+    );
   }
 
-  /** LIMITATION FACEBOOK : Messenger n'a pas de champ "description" de groupe. */
   async groupUpdateDescription() {
-    throw new Error('DESCRIPTION_NOT_SUPPORTED_BY_FACEBOOK');
+    throw new Error(
+      'DESCRIPTION_NOT_SUPPORTED_BY_FACEBOOK'
+    );
   }
 
-  async updateProfilePicture(chatId, buffer) {
-    const stream = await toAttachmentStream(buffer);
-    return callbackToPromise((cb) => this.api.changeGroupImage(stream, chatId, cb));
+  async updateProfilePicture(
+    chatId,
+    buffer
+  ) {
+    if (
+      typeof this.api
+        .changeGroupImage !==
+      'function'
+    ) {
+      throw new Error(
+        'changeGroupImage() non disponible.'
+      );
+    }
+
+    const stream =
+      await toAttachmentStream(
+        buffer
+      );
+
+    return callbackToPromise(
+      (cb) =>
+        this.api.changeGroupImage(
+          stream,
+          chatId,
+          cb
+        )
+    );
   }
 
-  /** LIMITATION FACEBOOK : pas de réglage "seuls les admins peuvent écrire" côté Messenger. */
   async groupSettingUpdate() {
-    throw new Error('SEND_PERMISSIONS_NOT_SUPPORTED_BY_FACEBOOK');
+    throw new Error(
+      'SEND_PERMISSIONS_NOT_SUPPORTED_BY_FACEBOOK'
+    );
   }
 }
